@@ -1,501 +1,134 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <title>Bridge Simulator</title>
-  <style>
-    body { font-family: sans-serif; margin: 16px; background: #f5f7fb; color: #0f172a; }
-    #app { display: grid; grid-template-columns: 380px 1fr; gap: 16px; align-items: start; }
-    .card { background: #fff; padding: 12px 14px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
-    label { display: block; margin: 8px 0 4px; font-weight: 600; }
-    input, select, button { width: 100%; padding: 8px; margin-bottom: 8px; border-radius: 6px; border: 1px solid #d4d8e1; }
-    button { cursor: pointer; border: none; background: #2563eb; color: #fff; font-weight: 600; }
-    button.secondary { background: #f1f5f9; color: #0f172a; border: 1px solid #d4d8e1; }
-    #status { padding: 10px; border-radius: 8px; font-weight: 700; margin: 10px 0; }
-    .ok { background: #e6f7ed; color: #1f7a3d; }
-    .fail { background: #ffecec; color: #c02828; }
-    canvas { width: 100%; height: 480px; background: #eef2f7; border-radius: 10px; cursor: grab; }
-    canvas.dragging { cursor: grabbing; }
-    ul { padding-left: 18px; }
-    li { margin: 4px 0; font-size: 14px; }
-    small { color: #475569; }
-    .inline { display: flex; gap: 8px; }
-    .inline > div { flex: 1; }
-  </style>
-</head>
-<body>
-<h2>Bridge Simulator (forces, bending, stress, deflection)</h2>
-<div id="app">
-  <div class="card">
-    <label>Bridge type</label>
-    <select id="structureType">
-      <option value="beam">Beam (simple span)</option>
-      <option value="truss">Truss (triangulated)</option>
-      <option value="arch">Arch (thrust-based)</option>
-    </select>
+import streamlit as st
+import numpy as np
 
-    <label>Material preset</label>
-    <select id="bridgeMaterial">
-      <option value="steel">Steel I-beam</option>
-      <option value="concrete">Prestressed concrete</option>
-      <option value="wood">Glulam timber</option>
-      <option value="custom">Custom</option>
-    </select>
+st.set_page_config(page_title="Bridge Simulator", layout="wide")
+st.title("Bridge Simulator (Beam, forces, bending, deflection)")
 
-    <div class="inline">
-      <div>
-        <label>Span (m)</label>
-        <input type="number" id="span" value="20" min="5" max="150" step="1">
-      </div>
-      <div>
-        <label>Capacity (kN)</label>
-        <input type="number" id="capacity" value="1200" min="100" max="5000" step="50">
-      </div>
-    </div>
+# Sidebar inputs
+st.sidebar.header("Bridge & Material")
+structure_type = st.sidebar.selectbox("Type", ["beam", "truss", "arch"])
+span = st.sidebar.slider("Span (m)", 5.0, 150.0, 20.0, 1.0)
+material = st.sidebar.selectbox("Material preset", ["steel", "concrete", "wood", "custom"])
 
-    <div class="inline">
-      <div>
-        <label>Moment capacity (kN·m)</label>
-        <input type="number" id="momentCapacity" value="2500" min="100" max="10000" step="50">
-      </div>
-      <div>
-        <label>Damping (visual only)</label>
-        <input type="number" id="damping" value="0.5" min="0" max="1" step="0.1">
-      </div>
-    </div>
+presets = {
+    "steel": dict(capacity=1200.0, moment_cap=2500.0, ei=20000.0, z=2.0),
+    "concrete": dict(capacity=900.0, moment_cap=1800.0, ei=15000.0, z=1.5),
+    "wood": dict(capacity=500.0, moment_cap=800.0, ei=7000.0, z=0.9),
+    "custom": None,
+}
 
-    <div class="inline">
-      <div>
-        <label>Flexural rigidity EI (kN·m²)</label>
-        <input type="number" id="ei" value="20000" min="500" max="200000" step="500">
-      </div>
-      <div>
-        <label>Section modulus Z (m³)</label>
-        <input type="number" id="sectionModulus" value="2" min="0.1" max="10" step="0.1">
-      </div>
-    </div>
+p = presets.get(material)
+capacity = st.sidebar.number_input("Total capacity (kN)", 100.0, 5000.0, p["capacity"] if p else 1200.0, 50.0)
+moment_capacity = st.sidebar.number_input("Moment capacity (kN·m)", 100.0, 10000.0, p["moment_cap"] if p else 2500.0, 50.0)
+ei = st.sidebar.number_input("Flexural rigidity EI (kN·m²)", 500.0, 200000.0, p["ei"] if p else 20000.0, 500.0)
+z = st.sidebar.number_input("Section modulus Z (m³)", 0.1, 10.0, p["z"] if p else 2.0, 0.1)
 
-    <label>Add load</label>
-    <select id="loadType">
-      <option value="car">Car (15 kN)</option>
-      <option value="truck">Truck (80 kN)</option>
-      <option value="bus">Bus (60 kN)</option>
-      <option value="custom">Custom</option>
-    </select>
-    <div class="inline">
-      <div>
-        <label>Custom weight (kN)</label>
-        <input type="number" id="customWeight" value="50" min="1" max="500" step="5" disabled>
-      </div>
-      <div>
-        <label>Position (0–100%)</label>
-        <input type="number" id="position" value="50" min="0" max="100" step="5">
-      </div>
-    </div>
-    <button id="addBtn">Add load</button>
-    <button class="secondary" id="resetBtn">Reset loads</button>
+# Structure behavior multipliers
+struct_cfg = {
+    "beam": dict(stiffness_factor=1.0, moment_factor=1.0),
+    "truss": dict(stiffness_factor=1.5, moment_factor=0.8),
+    "arch": dict(stiffness_factor=2.0, moment_factor=0.6),
+}[structure_type]
 
-    <div id="status" class="ok">Bridge OK</div>
-    <p><strong>Total load:</strong> <span id="totalLoad">0</span> kN</p>
-    <p><strong>Capacity:</strong> <span id="capText">1200</span> kN</p>
-    <p><strong>Max bending moment:</strong> <span id="momentText">0</span> / <span id="momentCapText">2500</span> kN·m</p>
-    <p><strong>Max stress (M/Z):</strong> <span id="stressText">0</span> kN/m²</p>
-    <p><strong>Support reactions:</strong> L <span id="leftReaction">0</span> kN, R <span id="rightReaction">0</span> kN</p>
-    <p><strong>Max deflection:</strong> <span id="deflectionText">0</span> m (limit L/360)</p>
+# Load input (single load for simplicity)
+st.sidebar.header("Load")
+load_type = st.sidebar.selectbox("Load type", ["car (15 kN)", "bus (60 kN)", "truck (80 kN)", "custom"])
+if load_type.startswith("car"):
+    w = 15.0
+elif load_type.startswith("bus"):
+    w = 60.0
+elif load_type.startswith("truck"):
+    w = 80.0
+else:
+    w = st.sidebar.number_input("Custom load (kN)", 1.0, 500.0, 50.0, 1.0)
 
-    <h4>Loads (drag on canvas to move):</h4>
-    <ul id="loadList"></ul>
-  </div>
+pos_pct = st.sidebar.slider("Load position (% of span)", 0.0, 100.0, 50.0, 1.0)
+pos = pos_pct / 100 * span
 
-  <div class="card">
-    <canvas id="canvas" width="1100" height="480"></canvas>
-    <small>Blue bars = loads (drag to move). Green = deflection. Red = shear diagram. Purple = bending moment diagram.</small>
-  </div>
-</div>
+# Reactions
+R2 = w * pos / span  # right support
+R1 = w - R2          # left support
 
-<script>
-(function() {
-  const canvas = document.getElementById('canvas');
-  const ctx = canvas.getContext('2d');
+# Diagrams
+steps = 200
+xs = np.linspace(0, span, steps + 1)
+shear = np.zeros_like(xs)
+moment = np.zeros_like(xs)
+max_shear = 0
+max_moment = 0
+for i, x in enumerate(xs):
+    V = R1
+    if x >= pos:
+        V -= w
+    M = R1 * x - (w * (x - pos) if x >= pos else 0)
+    M *= struct_cfg["moment_factor"]
+    shear[i] = V
+    moment[i] = M
+    max_shear = max(max_shear, abs(V))
+    max_moment = max(max_moment, abs(M))
 
-  const structureType = document.getElementById('structureType');
-  const bridgeMaterial = document.getElementById('bridgeMaterial');
-  const spanInput = document.getElementById('span');
-  const capacityInput = document.getElementById('capacity');
-  const momentCapacityInput = document.getElementById('momentCapacity');
-  const eiInput = document.getElementById('ei');
-  const sectionModulusInput = document.getElementById('sectionModulus');
-  const dampingInput = document.getElementById('damping');
-  const loadType = document.getElementById('loadType');
-  const customWeight = document.getElementById('customWeight');
-  const positionInput = document.getElementById('position');
-  const addBtn = document.getElementById('addBtn');
-  const resetBtn = document.getElementById('resetBtn');
-  const loadList = document.getElementById('loadList');
-  const totalLoadEl = document.getElementById('totalLoad');
-  const capText = document.getElementById('capText');
-  const momentText = document.getElementById('momentText');
-  const momentCapText = document.getElementById('momentCapText');
-  const stressText = document.getElementById('stressText');
-  const leftReactionEl = document.getElementById('leftReaction');
-  const rightReactionEl = document.getElementById('rightReaction');
-  const deflectionText = document.getElementById('deflectionText');
-  const status = document.getElementById('status');
+# Deflection via double integration of M/EI (very simplified)
+stiff_ei = ei * struct_cfg["stiffness_factor"]
+slopes = np.zeros_like(xs)
+defl = np.zeros_like(xs)
+for i in range(1, len(xs)):
+    dx = xs[i] - xs[i-1]
+    m_avg = 0.5 * (moment[i] + moment[i-1])
+    slopes[i] = slopes[i-1] + (m_avg / stiff_ei) * dx
+    defl[i] = defl[i-1] + slopes[i] * dx
 
-  // Presets for material properties and capacities
-  const materials = {
-    steel: { capacity: 1200, moment: 2500, ei: 20000, z: 2.0 },
-    concrete: { capacity: 900, moment: 1800, ei: 15000, z: 1.5 },
-    wood: { capacity: 500, moment: 800, ei: 7000, z: 0.9 },
-    custom: null
-  };
+# Anchor deflection to zero at supports
+baseline = np.linspace(defl[0], defl[-1], len(defl))
+defl = defl - baseline
+max_defl = np.max(np.abs(defl))
+allowable_defl = span / 360
+stress = max_moment / z
 
-  // Simplified structure-type behavior multipliers
-  const structures = {
-    beam:  { stiffnessFactor: 1.0, momentFactor: 1.0 },
-    truss: { stiffnessFactor: 1.5, momentFactor: 0.8 },
-    arch:  { stiffnessFactor: 2.0, momentFactor: 0.6 }
-  };
+# Status
+overload = w > capacity
+bend_fail = max_moment > moment_capacity
+defl_fail = max_defl > allowable_defl
+status = "OK"
+reasons = []
+if overload: reasons.append("total load exceeds capacity")
+if bend_fail: reasons.append("moment exceeds capacity")
+if defl_fail: reasons.append("deflection exceeds L/360")
+if reasons:
+    status = "FAILED: " + " & ".join(reasons)
 
-  let loads = [];
-  let dragId = null;
+# Display numbers
+colA, colB, colC, colD = st.columns(4)
+colA.metric("Total load (kN)", f"{w:.1f}")
+colB.metric("Support L (kN)", f"{R1:.1f}")
+colC.metric("Support R (kN)", f"{R2:.1f}")
+colD.metric("Status", status)
 
-  function typeToWeight(t) {
-    if (t === 'car') return 15;
-    if (t === 'truck') return 80;
-    if (t === 'bus') return 60;
-    return Number(customWeight.value) || 0;
-  }
+col1, col2, col3 = st.columns(3)
+col1.metric("Max moment (kN·m)", f"{max_moment:.1f}", f"limit {moment_capacity:.0f}")
+col2.metric("Max shear (kN)", f"{max_shear:.1f}")
+col3.metric("Max stress (M/Z)", f"{stress:.2f}")
 
-  function applyPreset() {
-    const preset = materials[bridgeMaterial.value];
-    if (!preset) return;
-    capacityInput.value = preset.capacity;
-    momentCapacityInput.value = preset.moment;
-    eiInput.value = preset.ei;
-    sectionModulusInput.value = preset.z;
-    render();
-  }
+col4, col5 = st.columns(2)
+col4.metric("Max deflection (m)", f"{max_defl:.5f}")
+col5.metric("Deflection limit (m)", f"{allowable_defl:.5f}")
 
-  bridgeMaterial.addEventListener('change', applyPreset);
-  structureType.addEventListener('change', render);
+# Plots
+import plotly.graph_objects as go
 
-  loadType.addEventListener('change', () => {
-    customWeight.disabled = loadType.value !== 'custom';
-  });
+fig_shear = go.Figure()
+fig_shear.add_trace(go.Scatter(x=xs, y=shear, mode="lines", name="Shear", line=dict(color="red")))
+fig_shear.update_layout(title="Shear Diagram", xaxis_title="x (m)", yaxis_title="Shear (kN)", height=320)
 
-  addBtn.addEventListener('click', () => {
-    const w = typeToWeight(loadType.value);
-    const posPct = Math.max(0, Math.min(100, Number(positionInput.value)));
-    const span = Math.max(1, Number(spanInput.value));
-    loads.push({ w, pos: posPct / 100 * span });
-    render();
-  });
+fig_moment = go.Figure()
+fig_moment.add_trace(go.Scatter(x=xs, y=moment, mode="lines", name="Moment", line=dict(color="purple")))
+fig_moment.update_layout(title="Moment Diagram", xaxis_title="x (m)", yaxis_title="Moment (kN·m)", height=320)
 
-  resetBtn.addEventListener('click', () => {
-    loads = [];
-    render();
-  });
+fig_defl = go.Figure()
+fig_defl.add_trace(go.Scatter(x=xs, y=defl, mode="lines", name="Deflection", line=dict(color="green")))
+fig_defl.update_layout(title="Deflection (scaled)", xaxis_title="x (m)", yaxis_title="Deflection (m)", height=320)
 
-  [spanInput, capacityInput, momentCapacityInput, dampingInput, eiInput, sectionModulusInput].forEach(el => {
-    el.addEventListener('input', render);
-  });
+st.plotly_chart(fig_shear, use_container_width=True)
+st.plotly_chart(fig_moment, use_container_width=True)
+st.plotly_chart(fig_defl, use_container_width=True)
 
-  function computeReactions(span) {
-    const total = loads.reduce((s, l) => s + l.w, 0);
-    const momentSum = loads.reduce((s, l) => s + l.w * l.pos, 0);
-    const right = span > 0 ? momentSum / span : 0;
-    const left = total - right;
-    return { left, right, total };
-  }
-
-  function computeDiagrams(span, reactions, typeConfig) {
-    const steps = 200;
-    const shearPoints = [];
-    const momentPoints = [];
-    let maxShear = 0;
-    let maxMoment = 0;
-    for (let i = 0; i <= steps; i++) {
-      const x = (i / steps) * span;
-      let shear = reactions.left;
-      loads.forEach(l => { if (x >= l.pos) shear -= l.w; });
-      let moment = reactions.left * x - loads.reduce((s, l) => s + (x >= l.pos ? l.w * (x - l.pos) : 0), 0);
-      moment *= typeConfig.momentFactor; // structure effect on bending
-      maxShear = Math.max(maxShear, Math.abs(shear));
-      maxMoment = Math.max(maxMoment, Math.abs(moment));
-      shearPoints.push({ x, v: shear });
-      momentPoints.push({ x, v: moment });
-    }
-    return { shearPoints, momentPoints, maxShear, maxMoment };
-  }
-
-  // Simple numerical double-integration for deflection
-  function computeDeflection(diagrams, span, ei, typeConfig) {
-    const pts = diagrams.momentPoints;
-    if (!pts.length) return { deflections: [], max: 0 };
-    const deflections = [];
-    let slope = 0;
-    let defl = 0;
-    const stiffEI = Math.max(1, ei) * typeConfig.stiffnessFactor;
-    for (let i = 0; i < pts.length; i++) {
-      if (i > 0) {
-        const dx = (pts[i].x - pts[i - 1].x);
-        const mAvg = (pts[i].v + pts[i - 1].v) / 2;
-        slope += (mAvg / stiffEI) * dx;
-        defl += slope * dx;
-      }
-      deflections.push(defl);
-    }
-    // Anchor deflection to zero at supports
-    const end0 = deflections[0];
-    const end1 = deflections[deflections.length - 1];
-    const corrected = deflections.map((d, i) => {
-      const t = i / (deflections.length - 1);
-      const baseline = end0 + t * (end1 - end0);
-      return d - baseline;
-    });
-    const maxDefl = corrected.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-    return { deflections: corrected, max: maxDefl };
-  }
-
-  function drawBridge(span, reactions, diagrams, deflection) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const margin = 50;
-    const yBeam = canvas.height * 0.6;
-    const scaleX = (canvas.width - 2 * margin) / span;
-
-    // Beam baseline
-    ctx.strokeStyle = '#111827';
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.moveTo(margin, yBeam);
-    ctx.lineTo(canvas.width - margin, yBeam);
-    ctx.stroke();
-
-    // Supports
-    ctx.fillStyle = '#6b7280';
-    ctx.fillRect(margin - 22, yBeam, 44, 50);
-    ctx.fillRect(canvas.width - margin - 22, yBeam, 44, 50);
-
-    // Tick marks
-    ctx.strokeStyle = '#cbd5e1';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 10; i++) {
-      const x = margin + i * (canvas.width - 2 * margin) / 10;
-      ctx.beginPath();
-      ctx.moveTo(x, yBeam);
-      ctx.lineTo(x, yBeam - 10);
-      ctx.stroke();
-    }
-
-    drawDeflection(deflection, span, scaleX, margin, yBeam);
-    drawLoads(span, scaleX, margin, yBeam);
-    drawReactions(reactions, margin, yBeam);
-    drawDiagrams(diagrams, span, scaleX, margin);
-  }
-
-  function drawDeflection(deflection, span, scaleX, margin, yBeam) {
-    if (!deflection.deflections.length) return;
-    const maxVis = Math.max(0.001, deflection.max);
-    const scaleY = Math.min(140, 140 / maxVis); // scale visually
-    ctx.strokeStyle = '#16a34a';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    deflection.deflections.forEach((d, i) => {
-      const x = margin + (span * i / (deflection.deflections.length - 1)) * scaleX;
-      const y = yBeam + d * scaleY;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-    ctx.fillStyle = '#16a34a';
-    ctx.font = '12px sans-serif';
-    ctx.fillText('Deflection (scaled)', margin + 6, yBeam + 30);
-  }
-
-  function drawLoads(span, scaleX, margin, yBeam) {
-    loads.forEach((load, idx) => {
-      const x = margin + load.pos * scaleX;
-      const h = Math.min(160, load.w * 1.2);
-      ctx.fillStyle = '#1d4ed8';
-      ctx.fillRect(x - 14, yBeam - h, 28, h);
-
-      ctx.fillStyle = '#0f172a';
-      ctx.font = '12px sans-serif';
-      ctx.fillText(`${load.w} kN`, x - 18, yBeam - h - 6);
-      ctx.fillText(`#${idx + 1}`, x - 10, yBeam + 16);
-    });
-  }
-
-  function drawReactions(reactions, margin, yBeam) {
-    const arrow = (x, y, dir) => {
-      ctx.strokeStyle = '#16a34a';
-      ctx.fillStyle = '#16a34a';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(x, y - dir * 50);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(x - 6, y - dir * 50 + dir * 12);
-      ctx.lineTo(x + 6, y - dir * 50 + dir * 12);
-      ctx.lineTo(x, y - dir * 50);
-      ctx.fill();
-    };
-    arrow(margin, yBeam + 4, 1);
-    arrow(canvas.width - margin, yBeam + 4, 1);
-
-    ctx.fillStyle = '#16a34a';
-    ctx.font = '12px sans-serif';
-    ctx.fillText(`${reactions.left.toFixed(1)} kN`, margin - 28, yBeam + 70);
-    ctx.fillText(`${reactions.right.toFixed(1)} kN`, canvas.width - margin - 34, yBeam + 70);
-  }
-
-  function drawDiagrams(diagrams, span, scaleX, margin) {
-    const shearBase = canvas.height * 0.22;
-    const momentBase = canvas.height * 0.40;
-    const shearScale = diagrams.maxShear > 0 ? (canvas.height * 0.14) / diagrams.maxShear : 0;
-    const momentScale = diagrams.maxMoment > 0 ? (canvas.height * 0.16) / diagrams.maxMoment : 0;
-
-    ctx.lineWidth = 2;
-
-    // Shear diagram
-    ctx.strokeStyle = '#ef4444';
-    ctx.beginPath();
-    diagrams.shearPoints.forEach((p, i) => {
-      const x = margin + p.x * scaleX;
-      const y = shearBase - p.v * shearScale;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-    ctx.fillStyle = '#ef4444';
-    ctx.font = '12px sans-serif';
-    ctx.fillText('Shear (kN)', margin + 6, shearBase - 6);
-
-    // Moment diagram
-    ctx.strokeStyle = '#8b5cf6';
-    ctx.beginPath();
-    diagrams.momentPoints.forEach((p, i) => {
-      const x = margin + p.x * scaleX;
-      const y = momentBase - p.v * momentScale;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-    ctx.fillStyle = '#8b5cf6';
-    ctx.font = '12px sans-serif';
-    ctx.fillText('Moment (kN·m)', margin + 6, momentBase - 6);
-
-    // Axes
-    ctx.strokeStyle = '#cbd5e1';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(margin, shearBase); ctx.lineTo(canvas.width - margin, shearBase);
-    ctx.moveTo(margin, momentBase); ctx.lineTo(canvas.width - margin, momentBase);
-    ctx.stroke();
-  }
-
-  function updateStatus(total, capacity, maxMoment, momentCapacity, maxDeflection, span, stress, allowableDeflection) {
-    totalLoadEl.textContent = total.toFixed(1);
-    capText.textContent = capacity.toFixed(1);
-    momentText.textContent = maxMoment.toFixed(1);
-    momentCapText.textContent = momentCapacity.toFixed(1);
-    stressText.textContent = stress.toFixed(2);
-    deflectionText.textContent = `${maxDeflection.toFixed(4)} m (limit ${allowableDeflection.toFixed(4)} m)`;
-    const overload = total > capacity;
-    const bendFail = maxMoment > momentCapacity;
-    const deflFail = maxDeflection > allowableDeflection;
-    if (!overload && !bendFail && !deflFail) {
-      status.textContent = 'Bridge OK';
-      status.className = 'ok';
-    } else {
-      const reasons = [];
-      if (overload) reasons.push('total load exceeds capacity');
-      if (bendFail) reasons.push('bending moment exceeds capacity');
-      if (deflFail) reasons.push('deflection exceeds limit');
-      status.textContent = 'Bridge FAILED: ' + reasons.join(' & ');
-      status.className = 'fail';
-    }
-  }
-
-  function renderList(span) {
-    loadList.innerHTML = '';
-    loads.forEach((l, i) => {
-      const item = document.createElement('li');
-      item.textContent = `#${i + 1}: ${l.w} kN at ${l.pos.toFixed(2)} m (${(l.pos / span * 100).toFixed(1)}%)`;
-      loadList.appendChild(item);
-    });
-  }
-
-  function render() {
-    const span = Math.max(1, Number(spanInput.value));
-    const capacity = Math.max(1, Number(capacityInput.value));
-    const momentCapacity = Math.max(1, Number(momentCapacityInput.value));
-    const ei = Math.max(1, Number(eiInput.value));
-    const z = Math.max(0.01, Number(sectionModulusInput.value));
-    const typeConfig = structures[structureType.value] || structures.beam;
-    const reactions = computeReactions(span);
-    const diagrams = computeDiagrams(span, reactions, typeConfig);
-    const deflection = computeDeflection(diagrams, span, ei, typeConfig);
-    const stress = diagrams.maxMoment / z;
-    const allowableDeflection = span / 360; // common serviceability guideline
-
-    drawBridge(span, reactions, diagrams, deflection);
-    renderList(span);
-    leftReactionEl.textContent = reactions.left.toFixed(1);
-    rightReactionEl.textContent = reactions.right.toFixed(1);
-    updateStatus(reactions.total, capacity, diagrams.maxMoment, momentCapacity, deflection.max, span, stress, allowableDeflection);
-  }
-
-  function canvasToSpan(xCanvas, span) {
-    const margin = 50;
-    const scaleX = (canvas.width - 2 * margin) / span;
-    const xClamped = Math.min(canvas.width - margin, Math.max(margin, xCanvas));
-    return (xClamped - margin) / scaleX;
-  }
-
-  function pickLoad(xCanvas, span) {
-    const margin = 50;
-    const scaleX = (canvas.width - 2 * margin) / span;
-    const threshold = 18; // pick radius
-    for (let i = loads.length - 1; i >= 0; i--) {
-      const loadX = margin + loads[i].pos * scaleX;
-      if (Math.abs(loadX - xCanvas) < threshold) return i;
-    }
-    return null;
-  }
-
-  // Drag to move loads
-  canvas.addEventListener('pointerdown', (e) => {
-    const span = Math.max(1, Number(spanInput.value));
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const id = pickLoad(x, span);
-    if (id !== null) {
-      dragId = id;
-      canvas.classList.add('dragging');
-    }
-  });
-
-  canvas.addEventListener('pointermove', (e) => {
-    if (dragId === null) return;
-    const span = Math.max(1, Number(spanInput.value));
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    loads[dragId].pos = Math.max(0, Math.min(span, canvasToSpan(x, span)));
-    render();
-  });
-
-  canvas.addEventListener('pointerup', () => {
-    dragId = null;
-    canvas.classList.remove('dragging');
-  });
-  canvas.addEventListener('pointerleave', () => {
-    dragId = null;
-    canvas.classList.remove('dragging');
-  });
-
-  applyPreset();
-  render();
-})();
-</script>
-</body>
-</html>
+st.caption("Simplified model: simply supported beam, single point load, small-deflection theory, structure type adjusts bending and stiffness heuristically. Extend by adding multiple loads, distributed loads, or more accurate deflection formulas.")
